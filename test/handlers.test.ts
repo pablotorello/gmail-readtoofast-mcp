@@ -121,6 +121,87 @@ const message = (id: string, overrides: Record<string, unknown> = {}) => ({
 beforeEach(() => {
 	requests = [];
 });
+
+describe("source body capture", () => {
+	test("preserves HTML hrefs and complete redirect queries", async () => {
+		const { handlers } = await boot();
+		const html =
+			'<p>Read <a href="https://substack.com/redirect/example?j=complete-token&amp;x=2">here</a></p>';
+		serveGmail([
+			[
+				/\/messages\/m1\?format=full/,
+				() =>
+					message("m1", {
+						payload: { mimeType: "text/html", body: { data: b64url(html) } },
+					}),
+			],
+		]);
+		const out = result(
+			await tool(handlers, "get_message")({ messageId: "m1", bodyFormat: "source", bodyOffset: 0 }),
+		);
+		expect(out.body).toBe(html);
+		expect(out.bodyMimeType).toBe("text/html");
+		expect((out.bodyPage as { nextOffset: number | null }).nextOffset).toBeNull();
+	});
+
+	test("pages externalized plain text before choosing an inline HTML alternative", async () => {
+		const { handlers } = await boot();
+		const body = `${"x".repeat(50_000)}final link https://example.com/last`;
+		serveGmail([
+			[
+				/\/messages\/m1\?format=full/,
+				() =>
+					message("m1", {
+						payload: {
+							mimeType: "multipart/alternative",
+							parts: [
+								{ mimeType: "text/plain", body: { attachmentId: "body1", size: body.length } },
+								{ mimeType: "text/html", body: { data: b64url("<p>short alternative</p>") } },
+							],
+						},
+					}),
+			],
+			[/\/attachments\/body1/, () => ({ data: b64url(body) })],
+		]);
+		const first = result(
+			await tool(handlers, "get_message")({ messageId: "m1", bodyFormat: "source", bodyOffset: 0 }),
+		);
+		const last = result(
+			await tool(
+				handlers,
+				"get_message",
+			)({ messageId: "m1", bodyFormat: "source", bodyOffset: 50_000 }),
+		);
+		expect(String(first.body) + String(last.body)).toBe(body);
+		expect(first.bodyMimeType).toBe("text/plain");
+		expect(requests.every((r) => r.method === "GET")).toBe(true);
+	});
+
+	test("fails when source bytes are unavailable instead of returning a complete placeholder", async () => {
+		const { handlers } = await boot();
+		serveGmail([
+			[
+				/\/messages\/m1\?format=full/,
+				() =>
+					message("m1", {
+						payload: { mimeType: "text/plain", body: { attachmentId: "body1", size: 2_000_000 } },
+					}),
+			],
+		]);
+		await expect(
+			tool(handlers, "get_message")({ messageId: "m1", bodyFormat: "source", bodyOffset: 0 }),
+		).rejects.toThrow("incomplete");
+		expect(requests).toHaveLength(1);
+	});
+
+	test("leaves the existing reader response unchanged when paging is not requested", async () => {
+		const { handlers } = await boot();
+		serveGmail([[/\/messages\/m1\?format=full/, () => message("m1")]]);
+		const out = result(await tool(handlers, "get_message")({ messageId: "m1" }));
+		expect(out.body).toBe("the original body");
+		expect(out.bodyPage).toBeUndefined();
+	});
+});
 afterEach(() => {
 	globalThis.fetch = realFetch;
 });

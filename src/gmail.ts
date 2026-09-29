@@ -930,6 +930,16 @@ export function extractBody(payload: GmailPart | undefined): string {
 	return "";
 }
 
+// Collection needs the selected MIME body, including HTML hrefs. The usual
+// reader above intentionally strips markup and remains unchanged for callers.
+export function extractSourceBody(payload: GmailPart | undefined) {
+	const parts = bodyParts(payload);
+	const part =
+		parts.find((p) => p.mimeType === "text/plain" && (p.body?.data || p.body?.attachmentId)) ??
+		parts.find((p) => p.mimeType === "text/html" && (p.body?.data || p.body?.attachmentId));
+	return part ? { body: part.body?.data ? decodePartData(part) : null, part } : null;
+}
+
 // The HTML alternative as the sender wrote it, markup intact. extractBody
 // strips the tags because it answers a reader; a rebuild has to carry the
 // part itself, or a draft edited once would lose its formatting.
@@ -1029,7 +1039,12 @@ export function textPartAttachment(
 	};
 }
 
-export function decodeAttachmentText(data: string, mimeType: string, charset: string): string {
+export function decodeAttachmentText(
+	data: string,
+	mimeType: string,
+	charset: string,
+	preserveHtml = false,
+): string {
 	const bytes = b64urlToBytes(data);
 	let text: string;
 	try {
@@ -1037,7 +1052,7 @@ export function decodeAttachmentText(data: string, mimeType: string, charset: st
 	} catch {
 		text = new TextDecoder().decode(bytes);
 	}
-	return mimeType === "text/html" ? htmlToText(text) : text;
+	return mimeType === "text/html" && !preserveHtml ? htmlToText(text) : text;
 }
 
 export function truncate(text: string, limit: number): string {
