@@ -15,6 +15,7 @@ import {
 	encodedSize,
 	extractBody,
 	extractHtmlBody,
+	extractSourceBody,
 	type FilePart,
 	forwardHeaderBlock,
 	forwardHtmlBlock,
@@ -39,6 +40,7 @@ import {
 	truncate,
 } from "./gmail";
 import { GoogleHandler } from "./google-handler";
+import { messagePage } from "./message-page";
 import { BodyTooLarge, type Props, readBoundedBody, refreshGoogleToken } from "./utils";
 
 type TokenCache = { accessToken: string; expiresAt: number };
@@ -399,6 +401,25 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 		);
 		if (!att?.data) return "";
 		return decodeAttachmentText(att.data, ref.mimeType, ref.charset);
+	}
+
+	private async messageSourceBody(m: GmailMessage) {
+		const source = extractSourceBody(m.payload);
+		if (!source) throw new Error("message body unavailable; cannot certify a complete capture");
+		const { part } = source;
+		const mimeType = part.mimeType ?? "text/plain";
+		if (source.body !== null) return { body: source.body, mimeType };
+		if ((part.body?.size ?? 0) > ATTACHMENT_BYTE_LIMIT) {
+			throw new Error("message body exceeds the server read limit; capture is incomplete");
+		}
+		const att = await this.api<AttachmentBody>(
+			`/messages/${encodeURIComponent(m.id ?? "")}/attachments/${encodeURIComponent(part.body?.attachmentId ?? "")}`,
+		);
+		if (!att.data) throw new Error("message body bytes unavailable; capture is incomplete");
+		return {
+			body: decodeAttachmentText(att.data, mimeType, partCharset(part), true),
+			mimeType,
+		};
 	}
 
 	// ---- Staged attachments -------------------------------------------------
@@ -838,16 +859,29 @@ export class GmailMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"get_message",
-			`Read a full message from ${account}, including decoded body text`,
-			{ messageId: z.string() },
-			async ({ messageId }) => {
+			`Read a message from ${account}. For complete capture use bodyFormat=source and bodyOffset=0; follow bodyPage.nextOffset until null. Source mode preserves HTML hrefs. Offsets are UTF-16 units and the SHA-256 covers the entire UTF-8 body. Default text mode retains the 50000-character preview limit.`,
+			{
+				messageId: z.string(),
+				bodyFormat: z.enum(["text", "source"]).default("text"),
+				bodyOffset: z.number().int().nonnegative().optional(),
+				bodyLimit: z.number().int().min(256).max(BODY_LIMIT).default(BODY_LIMIT),
+			},
+			async ({ messageId, bodyFormat = "text", bodyOffset, bodyLimit = BODY_LIMIT }) => {
 				const m = await this.api<GmailMessage>(
 					`/messages/${encodeURIComponent(messageId)}?format=full`,
 				);
+				const source = bodyFormat === "source" ? await this.messageSourceBody(m) : null;
+				const body = source ? source.body : await this.messageBody(m);
+				const page =
+					source || bodyOffset !== undefined
+						? await messagePage(body, bodyOffset ?? 0, bodyLimit)
+						: { body: truncate(body, BODY_LIMIT) };
 				return this.text({
 					...summarizeMessage(m),
 					messageIdHeader: headerValue(m, "Message-ID"),
-					body: truncate(await this.messageBody(m), BODY_LIMIT),
+					...page,
+					bodyFormat,
+					bodyMimeType: source?.mimeType ?? "text/plain",
 					attachments: collectAttachments(m.payload).map(describeAttachment),
 				});
 			},
